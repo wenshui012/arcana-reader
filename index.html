@@ -661,28 +661,27 @@ button{font-family:inherit;cursor:pointer;}input,select,textarea{font-family:inh
 const $=id=>document.getElementById(id),$$=sel=>document.querySelectorAll(sel);
 
 /* ================================================================
-   DEBUG PANEL (临时调试用，确认通信后删除)
+   0-PRE. EARLY POSTMESSAGE RECEIVER (must register before any await)
+   ================================================================ */
+
+/* ================================================================
+   DEBUG PANEL (临时调试用)
    ================================================================ */
 const _debugPanel = document.createElement('div');
-_debugPanel.id = 'debug-panel';
 _debugPanel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:40vh;overflow-y:auto;background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px 10px;z-index:99999;border-top:2px solid #0f0;';
 _debugPanel.innerHTML = '<div style="display:flex;justify-content:space-between;margin-bottom:4px;"><b>[调试面板]</b><span onclick="this.parentElement.parentElement.remove()" style="color:#f55;cursor:pointer;">关闭</span></div>';
 document.body.appendChild(_debugPanel);
 function _dbg(msg, color) {
-  const t = new Date().toLocaleTimeString();
   const line = document.createElement('div');
   line.style.color = color || '#0f0';
-  line.textContent = '[' + t + '] ' + msg;
+  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
   _debugPanel.appendChild(line);
   _debugPanel.scrollTop = _debugPanel.scrollHeight;
 }
 
-_dbg('页面开始加载');
-_dbg('location.hash = ' + location.hash);
-
-/* ================================================================
-   0-PRE. EARLY POSTMESSAGE RECEIVER (must register before any await)
-   ================================================================ */
+_dbg('页面加载');
+_dbg('hash = ' + location.hash);
+_dbg('opener = ' + (window.opener ? '存在' : 'null'));
 
 const _importHashMatch = location.hash.match(/^#import=(.+)$/);
 const _importNonce = _importHashMatch ? _importHashMatch[1] : null;
@@ -690,76 +689,67 @@ let _storageReady = null;
 const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
 let _pendingImport = null;
 
-_dbg('importNonce = ' + (_importNonce || '无 (非推送模式)'));
+_dbg('nonce = ' + (_importNonce || '无'));
+
+// If opener exists, proactively send READY
+if (_importNonce && window.opener) {
+  _dbg('通过 opener 主动发 READY', '#ff0');
+  try {
+    window.opener.postMessage({ type: 'ARCHIVE_READY', nonce: _importNonce }, '*');
+    _dbg('  → 发送成功', '#0f0');
+  } catch(err) {
+    _dbg('  → 发送失败: ' + err.message, '#f00');
+  }
+}
 
 if (_importNonce) {
-  _dbg('注册 message listener...', '#ff0');
-
+  // Listen for ALL messages (not just matching nonce) to debug
   window.addEventListener('message', (e) => {
-    // Log all incoming messages
-    _dbg('收到 message: origin=' + e.origin + ' type=' + (e.data?.type || '?') + ' nonce=' + (e.data?.nonce || '?').toString().slice(0,8) + '... hasSource=' + !!e.source);
+    _dbg('收到msg: origin=' + e.origin + ' type=' + (e.data?.type||'?') + ' hasSource=' + !!e.source, '#0ff');
 
-    if (!e.data || !e.data.nonce || e.data.nonce !== _importNonce) {
-      _dbg('  → nonce不匹配或无效，忽略', '#888');
-      return;
-    }
+    if (!e.data || !e.data.nonce || e.data.nonce !== _importNonce) return;
 
     if (e.data.type === 'ARCHIVE_PING') {
-      _dbg('  → 收到 PING，回复 READY...', '#0ff');
+      _dbg('PING matched! 回复READY...', '#ff0');
       try {
-        if (e.source) {
-          e.source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
-          _dbg('  → READY 已发送 ✓', '#0f0');
-        } else {
-          _dbg('  → e.source 为 null，无法回复！', '#f00');
-        }
-      } catch(err) {
-        _dbg('  → 回复失败: ' + err.message, '#f00');
-      }
+        if (e.source) { e.source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*'); _dbg('READY sent ✓', '#0f0'); }
+        else _dbg('e.source null!', '#f00');
+      } catch(err) { _dbg('回复失败: '+err.message, '#f00'); }
       return;
     }
 
     if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
-      _dbg('  → 收到故事数据! pushType=' + (e.data.story?._pushType || 'full') + ' hasChapters=' + !!(e.data.story?.chapters), '#ff0');
+      _dbg('收到故事! 等storage...', '#ff0');
       const source = e.source;
       _pendingImport = { story: e.data.story, nonce: e.data.nonce, source };
-      _dbg('  → 等待 storage 就绪...', '#ff0');
       _storagePromise.then(async (storage) => {
-        _dbg('  → storage 已就绪，开始写入...', '#0ff');
+        _dbg('storage就绪，写入中...', '#0ff');
         const imp = _pendingImport;
-        if (!imp) { _dbg('  → pendingImport 为空？', '#f00'); return; }
+        if (!imp) return;
         _pendingImport = null;
         try {
           const story = imp.story;
           if (!story) throw new Error('No story data');
           if (story._pushType === 'append' && story.storyId) {
             await storage.appendChapters(story.storyId, story.chapters);
-            _dbg('  → appendChapters 完成 ✓', '#0f0');
           } else if (story._pushType === 'collection' && story.collection) {
             await storage.saveCollection(story.collection);
-            _dbg('  → saveCollection 完成 ✓', '#0f0');
           } else {
             const clean = {...story}; delete clean._pushType;
             await storage.saveStory(clean);
-            _dbg('  → saveStory 完成 ✓', '#0f0');
           }
+          _dbg('写入成功 ✓', '#0f0');
           try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_SAVED', nonce: imp.nonce }, '*'); } catch(ex) {}
-          _dbg('已回复 ARCHIVE_SAVED ✓', '#0f0');
-          requestAnimationFrame(() => {
-            try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {}
-          });
+          requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
           if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
         } catch(err) {
-          _dbg('  → 写入失败: ' + err.message, '#f00');
+          _dbg('写入失败: ' + err.message, '#f00');
           try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_ERROR', nonce: imp.nonce, error: err.message }, '*'); } catch(ex) {}
         }
       });
     }
   });
-
-  _dbg('listener 注册完成 ✓', '#0f0');
-} else {
-  _dbg('非推送模式，跳过 listener 注册', '#888');
+  _dbg('listener已注册 ✓', '#0f0');
 }
 
 
@@ -917,7 +907,6 @@ await storage.migrateFromLocalStorage();
 
 // Signal storage is ready for early postMessage receiver
 if (_storageReady) _storageReady(storage);
-_dbg('storage 初始化完成，_storageReady 已 resolve', '#0f0');
 
 
 /* ================================================================
