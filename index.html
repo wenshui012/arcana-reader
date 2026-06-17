@@ -1254,21 +1254,20 @@ renderShelf();
    ================================================================ */
 
 (function initPostMessageReceiver(){
-  // Check if opened with import nonce in hash
   const hashMatch = location.hash.match(/^#import=(.+)$/);
   const importNonce = hashMatch ? hashMatch[1] : null;
+  const isIframe = (window !== window.top);
 
   window.addEventListener('message', async (e) => {
     if (!e.data || !e.data.nonce) return;
-    // Only accept messages with matching nonce (if we have one)
     if (importNonce && e.data.nonce !== importNonce) return;
 
-    const source = e.source; // the window that sent the message
+    // Determine reply target: e.source for direct, parent for iframe
+    const replyTarget = e.source || (isIframe ? window.parent : null);
 
     if (e.data.type === 'ARCHIVE_PING') {
-      // Respond that we're ready
       try {
-        if (source) source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
+        if (replyTarget) replyTarget.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
       } catch(err) {}
       return;
     }
@@ -1276,7 +1275,7 @@ renderShelf();
     if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
       const story = e.data.story;
       if (!story) {
-        replyTo(source, 'ARCHIVE_ERROR', e.data.nonce, 'No story data');
+        reply('ARCHIVE_ERROR', e.data.nonce, 'No story data');
         return;
       }
 
@@ -1290,24 +1289,25 @@ renderShelf();
           delete clean._pushType;
           await storage.saveStory(clean);
         }
-        replyTo(source, 'ARCHIVE_SAVED', e.data.nonce);
-        showToast('数据已接收并保存');
-        renderShelf();
+        reply('ARCHIVE_SAVED', e.data.nonce);
+        // Only show toast and refresh if not in iframe
+        if (!isIframe) {
+          showToast('数据已接收并保存');
+          renderShelf();
+        }
         if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
       } catch(err) {
-        replyTo(source, 'ARCHIVE_ERROR', e.data.nonce, err.message);
-        showToast('保存失败: ' + err.message);
+        reply('ARCHIVE_ERROR', e.data.nonce, err.message);
+        if (!isIframe) showToast('保存失败: ' + err.message);
       }
     }
-  });
 
-  function replyTo(source, type, nonce, error) {
-    const msg = { type, nonce };
-    if (error) msg.error = error;
-    try {
-      if (source) source.postMessage(msg, '*');
-    } catch(e) {}
-  }
+    function reply(type, nonce, error) {
+      const msg = { type, nonce };
+      if (error) msg.error = error;
+      try { if (replyTarget) replyTarget.postMessage(msg, '*'); } catch(ex) {}
+    }
+  });
 })();
 
 
