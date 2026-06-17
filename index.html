@@ -1258,56 +1258,54 @@ renderShelf();
   const hashMatch = location.hash.match(/^#import=(.+)$/);
   const importNonce = hashMatch ? hashMatch[1] : null;
 
-  if (importNonce && window.opener) {
-    // Signal ready to the opener
-    try {
-      window.opener.postMessage({ type: 'ARCHIVE_READY', nonce: importNonce }, '*');
-    } catch(e) {}
-  }
-
   window.addEventListener('message', async (e) => {
-    if (!e.data || !e.data.type || !e.data.nonce) return;
-    // Only accept messages with matching nonce
+    if (!e.data || !e.data.nonce) return;
+    // Only accept messages with matching nonce (if we have one)
     if (importNonce && e.data.nonce !== importNonce) return;
+
+    const source = e.source; // the window that sent the message
+
+    if (e.data.type === 'ARCHIVE_PING') {
+      // Respond that we're ready
+      try {
+        if (source) source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
+      } catch(err) {}
+      return;
+    }
 
     if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
       const story = e.data.story;
       if (!story) {
-        replyToOpener('ARCHIVE_ERROR', e.data.nonce, 'No story data');
+        replyTo(source, 'ARCHIVE_ERROR', e.data.nonce, 'No story data');
         return;
       }
 
       try {
         if (story._pushType === 'append' && story.storyId) {
-          // Incremental push
           await storage.appendChapters(story.storyId, story.chapters);
         } else if (story._pushType === 'collection' && story.collection) {
-          // Collection snippet
           await storage.saveCollection(story.collection);
         } else {
-          // Full story push
           const clean = {...story};
           delete clean._pushType;
           await storage.saveStory(clean);
         }
-        replyToOpener('ARCHIVE_SAVED', e.data.nonce);
+        replyTo(source, 'ARCHIVE_SAVED', e.data.nonce);
         showToast('数据已接收并保存');
-        // Refresh shelf if visible
         renderShelf();
-        // Clear the import hash
         if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
       } catch(err) {
-        replyToOpener('ARCHIVE_ERROR', e.data.nonce, err.message);
+        replyTo(source, 'ARCHIVE_ERROR', e.data.nonce, err.message);
         showToast('保存失败: ' + err.message);
       }
     }
   });
 
-  function replyToOpener(type, nonce, error) {
+  function replyTo(source, type, nonce, error) {
     const msg = { type, nonce };
     if (error) msg.error = error;
     try {
-      if (window.opener) window.opener.postMessage(msg, '*');
+      if (source) source.postMessage(msg, '*');
     } catch(e) {}
   }
 })();
