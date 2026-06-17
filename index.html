@@ -664,35 +664,14 @@ const $=id=>document.getElementById(id),$$=sel=>document.querySelectorAll(sel);
    0-PRE. HASH-BASED DATA RECEIVER (从URL hash接收推送数据)
    ================================================================ */
 
-const _debugPanel = document.createElement('div');
-_debugPanel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:40vh;overflow-y:auto;background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px 10px;z-index:99999;border-top:2px solid #0f0;';
-_debugPanel.innerHTML = '<div style="display:flex;justify-content:space-between;margin-bottom:4px;"><b>[调试面板]</b><span onclick="this.parentElement.parentElement.remove()" style="color:#f55;cursor:pointer;">关闭</span></div>';
-document.body.appendChild(_debugPanel);
-function _dbg(msg, color) {
-  const line = document.createElement('div');
-  line.style.color = color || '#0f0';
-  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
-  _debugPanel.appendChild(line);
-  _debugPanel.scrollTop = _debugPanel.scrollHeight;
-}
-
-_dbg('页面加载');
-_dbg('hash长度 = ' + location.hash.length + ' 前缀 = ' + location.hash.slice(0, 20));
-
 let _pushData = null;
 const _pushMatch = location.hash.match(/^#push=(.+)$/);
 if (_pushMatch) {
-  _dbg('检测到推送数据，解码中...', '#ff0');
   try {
     const decoded = decodeURIComponent(escape(atob(_pushMatch[1])));
     _pushData = JSON.parse(decoded);
-    _dbg('解码成功! type=' + (_pushData._pushType || 'full'), '#0f0');
-  } catch(err) {
-    _dbg('解码失败: ' + err.message, '#f00');
-  }
+  } catch(err) {}
   history.replaceState(null, '', location.pathname);
-} else {
-  _dbg('普通访问，无推送数据', '#888');
 }
 
 let _storageReady = null;
@@ -700,25 +679,31 @@ const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
 
 if (_pushData) {
   _storagePromise.then(async (storage) => {
-    _dbg('storage就绪，写入中...', '#0ff');
     try {
       const data = _pushData;
       if (data._pushType === 'append' && data.storyId) {
         await storage.appendChapters(data.storyId, data.chapters);
-        _dbg('appendChapters 完成 ✓', '#0f0');
+        requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
       } else if (data._pushType === 'collection' && data.collection) {
         await storage.saveCollection(data.collection);
-        _dbg('saveCollection 完成 ✓', '#0f0');
+        requestAnimationFrame(() => { try { showToast('收藏已保存'); } catch(e) {} });
+      } else if (data._pushType === 'regex' && data.scripts) {
+        let count = 0;
+        for (const script of data.scripts) {
+          const clean = {...script}; delete clean._source;
+          await storage.saveRegex(clean);
+          count++;
+        }
+        requestAnimationFrame(() => {
+          try { showToast(count + ' 个正则脚本已同步'); loadRegex().then(() => renderRegexList()); } catch(e) {}
+        });
       } else {
         const clean = {...data}; delete clean._pushType;
         await storage.saveStory(clean);
-        _dbg('saveStory 完成 ✓', '#0f0');
+        requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
       }
-      requestAnimationFrame(() => {
-        try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {}
-      });
     } catch(err) {
-      _dbg('写入失败: ' + err.message, '#f00');
+      requestAnimationFrame(() => { try { showToast('保存失败: ' + err.message); } catch(e) {} });
     }
   });
 }
