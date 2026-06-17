@@ -661,12 +661,9 @@ button{font-family:inherit;cursor:pointer;}input,select,textarea{font-family:inh
 const $=id=>document.getElementById(id),$$=sel=>document.querySelectorAll(sel);
 
 /* ================================================================
-   0-PRE. EARLY POSTMESSAGE RECEIVER (must register before any await)
+   0-PRE. HASH-BASED DATA RECEIVER (从URL hash接收推送数据)
    ================================================================ */
 
-/* ================================================================
-   DEBUG PANEL (临时调试用)
-   ================================================================ */
 const _debugPanel = document.createElement('div');
 _debugPanel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:40vh;overflow-y:auto;background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px 10px;z-index:99999;border-top:2px solid #0f0;';
 _debugPanel.innerHTML = '<div style="display:flex;justify-content:space-between;margin-bottom:4px;"><b>[调试面板]</b><span onclick="this.parentElement.parentElement.remove()" style="color:#f55;cursor:pointer;">关闭</span></div>';
@@ -680,76 +677,50 @@ function _dbg(msg, color) {
 }
 
 _dbg('页面加载');
-_dbg('hash = ' + location.hash);
-_dbg('opener = ' + (window.opener ? '存在' : 'null'));
+_dbg('hash长度 = ' + location.hash.length + ' 前缀 = ' + location.hash.slice(0, 20));
 
-const _importHashMatch = location.hash.match(/^#import=(.+)$/);
-const _importNonce = _importHashMatch ? _importHashMatch[1] : null;
-let _storageReady = null;
-const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
-let _pendingImport = null;
-
-_dbg('nonce = ' + (_importNonce || '无'));
-
-// If opener exists, proactively send READY
-if (_importNonce && window.opener) {
-  _dbg('通过 opener 主动发 READY', '#ff0');
+let _pushData = null;
+const _pushMatch = location.hash.match(/^#push=(.+)$/);
+if (_pushMatch) {
+  _dbg('检测到推送数据，解码中...', '#ff0');
   try {
-    window.opener.postMessage({ type: 'ARCHIVE_READY', nonce: _importNonce }, '*');
-    _dbg('  → 发送成功', '#0f0');
+    const decoded = decodeURIComponent(escape(atob(_pushMatch[1])));
+    _pushData = JSON.parse(decoded);
+    _dbg('解码成功! type=' + (_pushData._pushType || 'full'), '#0f0');
   } catch(err) {
-    _dbg('  → 发送失败: ' + err.message, '#f00');
+    _dbg('解码失败: ' + err.message, '#f00');
   }
+  history.replaceState(null, '', location.pathname);
+} else {
+  _dbg('普通访问，无推送数据', '#888');
 }
 
-if (_importNonce) {
-  // Listen for ALL messages (not just matching nonce) to debug
-  window.addEventListener('message', (e) => {
-    _dbg('收到msg: origin=' + e.origin + ' type=' + (e.data?.type||'?') + ' hasSource=' + !!e.source, '#0ff');
+let _storageReady = null;
+const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
 
-    if (!e.data || !e.data.nonce || e.data.nonce !== _importNonce) return;
-
-    if (e.data.type === 'ARCHIVE_PING') {
-      _dbg('PING matched! 回复READY...', '#ff0');
-      try {
-        if (e.source) { e.source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*'); _dbg('READY sent ✓', '#0f0'); }
-        else _dbg('e.source null!', '#f00');
-      } catch(err) { _dbg('回复失败: '+err.message, '#f00'); }
-      return;
-    }
-
-    if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
-      _dbg('收到故事! 等storage...', '#ff0');
-      const source = e.source;
-      _pendingImport = { story: e.data.story, nonce: e.data.nonce, source };
-      _storagePromise.then(async (storage) => {
-        _dbg('storage就绪，写入中...', '#0ff');
-        const imp = _pendingImport;
-        if (!imp) return;
-        _pendingImport = null;
-        try {
-          const story = imp.story;
-          if (!story) throw new Error('No story data');
-          if (story._pushType === 'append' && story.storyId) {
-            await storage.appendChapters(story.storyId, story.chapters);
-          } else if (story._pushType === 'collection' && story.collection) {
-            await storage.saveCollection(story.collection);
-          } else {
-            const clean = {...story}; delete clean._pushType;
-            await storage.saveStory(clean);
-          }
-          _dbg('写入成功 ✓', '#0f0');
-          try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_SAVED', nonce: imp.nonce }, '*'); } catch(ex) {}
-          requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
-          if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
-        } catch(err) {
-          _dbg('写入失败: ' + err.message, '#f00');
-          try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_ERROR', nonce: imp.nonce, error: err.message }, '*'); } catch(ex) {}
-        }
+if (_pushData) {
+  _storagePromise.then(async (storage) => {
+    _dbg('storage就绪，写入中...', '#0ff');
+    try {
+      const data = _pushData;
+      if (data._pushType === 'append' && data.storyId) {
+        await storage.appendChapters(data.storyId, data.chapters);
+        _dbg('appendChapters 完成 ✓', '#0f0');
+      } else if (data._pushType === 'collection' && data.collection) {
+        await storage.saveCollection(data.collection);
+        _dbg('saveCollection 完成 ✓', '#0f0');
+      } else {
+        const clean = {...data}; delete clean._pushType;
+        await storage.saveStory(clean);
+        _dbg('saveStory 完成 ✓', '#0f0');
+      }
+      requestAnimationFrame(() => {
+        try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {}
       });
+    } catch(err) {
+      _dbg('写入失败: ' + err.message, '#f00');
     }
   });
-  _dbg('listener已注册 ✓', '#0f0');
 }
 
 
