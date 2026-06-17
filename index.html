@@ -660,6 +660,60 @@ button{font-family:inherit;cursor:pointer;}input,select,textarea{font-family:inh
 'use strict';
 const $=id=>document.getElementById(id),$$=sel=>document.querySelectorAll(sel);
 
+/* ================================================================
+   0-PRE. EARLY POSTMESSAGE RECEIVER (must register before any await)
+   ================================================================ */
+
+const _importHashMatch = location.hash.match(/^#import=(.+)$/);
+const _importNonce = _importHashMatch ? _importHashMatch[1] : null;
+let _storageReady = null;
+const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
+let _pendingImport = null;
+
+if (_importNonce) {
+  window.addEventListener('message', (e) => {
+    if (!e.data || !e.data.nonce || e.data.nonce !== _importNonce) return;
+
+    if (e.data.type === 'ARCHIVE_PING') {
+      try {
+        if (e.source) e.source.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
+      } catch(err) {}
+      return;
+    }
+
+    if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
+      const source = e.source;
+      _pendingImport = { story: e.data.story, nonce: e.data.nonce, source };
+      // Process once storage is ready
+      _storagePromise.then(async (storage) => {
+        const imp = _pendingImport;
+        if (!imp) return;
+        _pendingImport = null;
+        try {
+          const story = imp.story;
+          if (!story) throw new Error('No story data');
+          if (story._pushType === 'append' && story.storyId) {
+            await storage.appendChapters(story.storyId, story.chapters);
+          } else if (story._pushType === 'collection' && story.collection) {
+            await storage.saveCollection(story.collection);
+          } else {
+            const clean = {...story}; delete clean._pushType;
+            await storage.saveStory(clean);
+          }
+          try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_SAVED', nonce: imp.nonce }, '*'); } catch(ex) {}
+          // Refresh UI after init completes
+          requestAnimationFrame(() => {
+            try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {}
+          });
+          if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
+        } catch(err) {
+          try { if (imp.source) imp.source.postMessage({ type: 'ARCHIVE_ERROR', nonce: imp.nonce, error: err.message }, '*'); } catch(ex) {}
+        }
+      });
+    }
+  });
+}
+
 
 /* ================================================================
    0. STORAGE ADAPTER (IndexedDB)
@@ -812,6 +866,9 @@ const storage = await (function initStorage(){
 
 // Run one-time migration from old localStorage
 await storage.migrateFromLocalStorage();
+
+// Signal storage is ready for early postMessage receiver
+if (_storageReady) _storageReady(storage);
 
 
 /* ================================================================
@@ -1247,68 +1304,6 @@ const svBG=await lsGet('bgPreset','default');if(svBG!=='default')syncBg(svBG);
 await loadRegex();renderRegexList();
 injectIcons();
 renderShelf();
-
-
-/* ================================================================
-   J. POSTMESSAGE RECEIVER (从扩展端接收推送)
-   ================================================================ */
-
-(function initPostMessageReceiver(){
-  const hashMatch = location.hash.match(/^#import=(.+)$/);
-  const importNonce = hashMatch ? hashMatch[1] : null;
-  const isIframe = (window !== window.top);
-
-  window.addEventListener('message', async (e) => {
-    if (!e.data || !e.data.nonce) return;
-    if (importNonce && e.data.nonce !== importNonce) return;
-
-    // Determine reply target: e.source for direct, parent for iframe
-    const replyTarget = e.source || (isIframe ? window.parent : null);
-
-    if (e.data.type === 'ARCHIVE_PING') {
-      try {
-        if (replyTarget) replyTarget.postMessage({ type: 'ARCHIVE_READY', nonce: e.data.nonce }, '*');
-      } catch(err) {}
-      return;
-    }
-
-    if (e.data.type === 'ARCHIVE_IMPORT_STORY') {
-      const story = e.data.story;
-      if (!story) {
-        reply('ARCHIVE_ERROR', e.data.nonce, 'No story data');
-        return;
-      }
-
-      try {
-        if (story._pushType === 'append' && story.storyId) {
-          await storage.appendChapters(story.storyId, story.chapters);
-        } else if (story._pushType === 'collection' && story.collection) {
-          await storage.saveCollection(story.collection);
-        } else {
-          const clean = {...story};
-          delete clean._pushType;
-          await storage.saveStory(clean);
-        }
-        reply('ARCHIVE_SAVED', e.data.nonce);
-        // Only show toast and refresh if not in iframe
-        if (!isIframe) {
-          showToast('数据已接收并保存');
-          renderShelf();
-        }
-        if (location.hash.includes('import=')) history.replaceState(null, '', location.pathname);
-      } catch(err) {
-        reply('ARCHIVE_ERROR', e.data.nonce, err.message);
-        if (!isIframe) showToast('保存失败: ' + err.message);
-      }
-    }
-
-    function reply(type, nonce, error) {
-      const msg = { type, nonce };
-      if (error) msg.error = error;
-      try { if (replyTarget) replyTarget.postMessage(msg, '*'); } catch(ex) {}
-    }
-  });
-})();
 
 
 /* ================================================================
