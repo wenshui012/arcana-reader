@@ -676,32 +676,170 @@ if (_pushMatch) {
 
 let _storageReady = null;
 const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
+const ARCANA_PROTOCOL = 1;
+const ARCANA_SUPPORTED_PUSH_TYPES = ['story.full','story.append','collection','regex'];
+const ARCANA_RECEIVER_ID = 'arcana-web-' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+const _savedPushAcks = new Map();
+
+function normalizePushType(type, data){
+  if(type === 'append') return 'story.append';
+  if(type === 'full') return 'story.full';
+  if(type === 'story.append' || type === 'story.full' || type === 'collection' || type === 'regex') return type;
+  if(data?.chapters) return 'story.full';
+  return type || 'story.full';
+}
+
+function protocolError(code,message,retryable){
+  const err = new Error(message);
+  err.code = code;
+  err.retryable = retryable;
+  return err;
+}
+
+function countBlocks(chapters){
+  return (chapters||[]).reduce((sum,ch)=>sum+(Array.isArray(ch.blocks)?ch.blocks.length:0),0);
+}
+
+function cleanStoryPayload(data){
+  const clean = {...data};
+  delete clean._protocol;
+  delete clean._messageType;
+  delete clean._pushType;
+  delete clean.channelId;
+  delete clean.sentAt;
+  return clean;
+}
+
+async function saveIncomingPush(storage,data){
+  const pushType = normalizePushType(data?._pushType,data);
+  if(!ARCANA_SUPPORTED_PUSH_TYPES.includes(pushType)) throw protocolError('UNSUPPORTED_PUSH_TYPE','Unsupported push type: '+pushType,false);
+  if(pushType === 'story.append'){
+    if(!data.storyId || !Array.isArray(data.chapters)) throw protocolError('INVALID_MESSAGE','Missing storyId or chapters for append',false);
+    await storage.appendChapters(data.storyId,data.chapters);
+    return {pushType,status:'saved',saved:{storyId:data.storyId,collectionId:null,regexCount:0,chapterCount:data.chapters.length,blockCount:countBlocks(data.chapters)}};
+  }
+  if(pushType === 'collection'){
+    if(!data.collection || !data.collection.text) throw protocolError('INVALID_MESSAGE','Missing collection payload',false);
+    await storage.saveCollection(data.collection);
+    return {pushType,status:'saved',saved:{storyId:data.collection.storyId||null,collectionId:data.collection._id||null,regexCount:0,chapterCount:0,blockCount:1}};
+  }
+  if(pushType === 'regex'){
+    if(!Array.isArray(data.scripts)) throw protocolError('INVALID_MESSAGE','Missing regex scripts',false);
+    let count = 0;
+    for(const script of data.scripts){
+      const clean = {...script}; delete clean._source;
+      await storage.saveRegex(clean);
+      count++;
+    }
+    return {pushType,status:'saved',saved:{storyId:null,collectionId:null,regexCount:count,chapterCount:0,blockCount:0}};
+  }
+  if(!Array.isArray(data.chapters)) throw protocolError('INVALID_MESSAGE','Missing story chapters',false);
+  const clean = cleanStoryPayload(data);
+  await storage.saveStory(clean);
+  return {pushType,status:'saved',saved:{storyId:clean.id||null,collectionId:null,regexCount:0,chapterCount:clean.chapters.length,blockCount:countBlocks(clean.chapters)}};
+}
+
+function renderAfterIncomingPush(pushType,saved){
+  requestAnimationFrame(() => {
+    try {
+      if(pushType === 'collection'){
+        showToast('收藏已保存');
+        renderCollection();
+      } else if(pushType === 'regex'){
+        showToast((saved?.regexCount||0) + ' 个正则脚本已同步');
+        loadRegex().then(() => renderRegexList());
+      } else {
+        showToast('数据已接收并保存');
+        renderShelf();
+      }
+    } catch(e) {}
+  });
+}
+
+function replyTargetOrigin(event){
+  return event.origin && event.origin !== 'null' ? event.origin : '*';
+}
+
+function postProtocolReply(event,message){
+  try {
+    if(event.source && typeof event.source.postMessage === 'function') {
+      event.source.postMessage(message, replyTargetOrigin(event));
+    }
+  } catch(e) {}
+}
+
+function ackError(err){
+  const code = err?.code || (/Story not found/i.test(err?.message||'') ? 'STORY_NOT_FOUND' : 'STORAGE_FAILED');
+  const retryable = err?.retryable !== undefined ? err.retryable : !(code === 'STORY_NOT_FOUND' || code === 'INVALID_MESSAGE' || code === 'UNSUPPORTED_PUSH_TYPE');
+  return {code,message:err?.message||'Unknown error',retryable};
+}
+
+window.addEventListener('message', event => {
+  const data = event.data;
+  if(!data || typeof data !== 'object' || data._protocol !== ARCANA_PROTOCOL) return;
+  if(data._messageType === 'arcana.ping'){
+    if(!data.channelId) return;
+    _storagePromise.then(() => {
+      postProtocolReply(event,{
+        _protocol: ARCANA_PROTOCOL,
+        _messageType: 'arcana.ready',
+        channelId: data.channelId,
+        receiverId: ARCANA_RECEIVER_ID,
+        supportedPushTypes: ARCANA_SUPPORTED_PUSH_TYPES,
+        readyAt: new Date().toISOString()
+      });
+    });
+    return;
+  }
+  if(data._messageType !== 'arcana.push') return;
+  if(!data.pushId || !data.channelId) return;
+  const pushType = normalizePushType(data._pushType,data);
+  if(_savedPushAcks.has(data.pushId)){
+    const prev = _savedPushAcks.get(data.pushId);
+    postProtocolReply(event,{...prev,status:'duplicate',receivedAt:new Date().toISOString()});
+    return;
+  }
+  _storagePromise.then(async storage => {
+    const receivedAt = new Date().toISOString();
+    try {
+      const result = await saveIncomingPush(storage,data);
+      const ack = {
+        _protocol: ARCANA_PROTOCOL,
+        _messageType: 'arcana.ack',
+        _pushType: result.pushType,
+        pushId: data.pushId,
+        channelId: data.channelId,
+        ok: true,
+        status: result.status,
+        saved: result.saved,
+        receivedAt,
+        savedAt: new Date().toISOString()
+      };
+      _savedPushAcks.set(data.pushId,ack);
+      postProtocolReply(event,ack);
+      renderAfterIncomingPush(result.pushType,result.saved);
+    } catch(err) {
+      postProtocolReply(event,{
+        _protocol: ARCANA_PROTOCOL,
+        _messageType: 'arcana.ack',
+        _pushType: pushType,
+        pushId: data.pushId,
+        channelId: data.channelId,
+        ok: false,
+        status: 'error',
+        error: ackError(err),
+        receivedAt,
+        failedAt: new Date().toISOString()
+      });
+    }
+  });
+});
 
 if (_pushData) {
   _storagePromise.then(async (storage) => {
     try {
-      const data = _pushData;
-      if (data._pushType === 'append' && data.storyId) {
-        await storage.appendChapters(data.storyId, data.chapters);
-        requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
-      } else if (data._pushType === 'collection' && data.collection) {
-        await storage.saveCollection(data.collection);
-        requestAnimationFrame(() => { try { showToast('收藏已保存'); } catch(e) {} });
-      } else if (data._pushType === 'regex' && data.scripts) {
-        let count = 0;
-        for (const script of data.scripts) {
-          const clean = {...script}; delete clean._source;
-          await storage.saveRegex(clean);
-          count++;
-        }
-        requestAnimationFrame(() => {
-          try { showToast(count + ' 个正则脚本已同步'); loadRegex().then(() => renderRegexList()); } catch(e) {}
-        });
-      } else {
-        const clean = {...data}; delete clean._pushType;
-        await storage.saveStory(clean);
-        requestAnimationFrame(() => { try { showToast('数据已接收并保存'); renderShelf(); } catch(e) {} });
-      }
+      const result = await saveIncomingPush(storage,_pushData);
+      renderAfterIncomingPush(result.pushType,result.saved);
     } catch(err) {
       requestAnimationFrame(() => { try { showToast('保存失败: ' + err.message); } catch(e) {} });
     }
@@ -1048,7 +1186,6 @@ function openReaderAtChapter(story,chIdx){
   setTimeout(()=>{
     const cid='ch-'+chIdx;
     const el=document.getElementById(cid);if(el)el.scrollIntoView({behavior:'smooth'});
-    else goToChapterPaged(cid);
   },100);
 }
 $('detailBack').addEventListener('click',()=>{if(detailFrom==='reader'&&currentStory){showView($('readerView'),true);toggleBB(false);setTimeout(()=>window.scrollTo(0,savedScrollY),50);}else{showView($('shelfView'));renderShelf();}});
@@ -1315,7 +1452,7 @@ $('fileInput').addEventListener('change', async function handler(e) {
     reader.onload = async ev => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data._pushType === 'append' && data.storyId) {
+        if ((data._pushType === 'append' || data._pushType === 'story.append') && data.storyId) {
           await storage.appendChapters(data.storyId, data.chapters);
           showToast('章节已追加');
         } else if (data._pushType === 'collection' && data.collection) {
