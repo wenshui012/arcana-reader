@@ -679,6 +679,8 @@ const _storagePromise = new Promise(resolve => { _storageReady = resolve; });
 const ARCANA_PROTOCOL = 1;
 const ARCANA_SUPPORTED_PUSH_TYPES = ['story.full','story.append','collection','regex'];
 const ARCANA_RECEIVER_ID = 'arcana-web-' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+const ARCANA_READY_MARK = 'ARCANA_READY:';
+const ARCANA_ACK_MARK = 'ARCANA_ACK:';
 const _savedPushAcks = new Map();
 
 function normalizePushType(type, data){
@@ -760,12 +762,29 @@ function replyTargetOrigin(event){
   return event.origin && event.origin !== 'null' ? event.origin : '*';
 }
 
+function clearProtocolWindowName(){
+  try {
+    if(typeof window.name === 'string' && (window.name.startsWith(ARCANA_READY_MARK) || window.name.startsWith(ARCANA_ACK_MARK))){
+      window.name = 'arcana-reader';
+    }
+  } catch(e) {}
+}
+
+function writeProtocolWindowName(prefix,message){
+  try {
+    clearProtocolWindowName();
+    window.name = prefix + JSON.stringify(message);
+  } catch(e) {}
+}
+
 function postProtocolReply(event,message){
   try {
     if(event.source && typeof event.source.postMessage === 'function') {
       event.source.postMessage(message, replyTargetOrigin(event));
     }
   } catch(e) {}
+  if(message?._messageType === 'arcana.ready') writeProtocolWindowName(ARCANA_READY_MARK,message);
+  else if(message?._messageType === 'arcana.ack') writeProtocolWindowName(ARCANA_ACK_MARK,message);
 }
 
 function ackError(err){
